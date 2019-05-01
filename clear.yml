@@ -1,0 +1,125 @@
+---
+- hosts: postgres
+  gather_facts: true
+  become: true
+  vars:
+    max_wal_senders: 3
+    postgresql_version: 9.6
+    postgresql_locale_parts:
+      - "en_US" # Locale
+      - "UTF-8" # Encoding
+    postgresql_locale: "{{ postgresql_locale_parts | join('.') }}"
+    postgresql_env:
+      LC_ALL: "{{ postgresql_locale }}"
+      LC_LCTYPE: "{{ postgresql_locale }}"
+    # pg_hba.conf
+    postgresql_pg_hba_default:
+      - { type: local, database: all, user: "{{ postgresql_admin_user }}", address: "", method: "{{ postgresql_default_auth_method }}", comment: "" }
+      - { type: local, database: all, user: all, address: "",             method: "{{ postgresql_default_auth_method }}", comment: '"local" is for Unix domain socket connections only' }
+      - { type: host,  database: all, user: all, address: "127.0.0.1/32", method: "{{ postgresql_default_auth_method }}", comment: "IPv4 local connections:" }
+      - { type: host,  database: all, user: all, address: "::1/128",      method: "{{ postgresql_default_auth_method }}", comment: "IPv6 local connections:" }
+    postgresql_pg_hba_custom:
+      - { type: host, database: replication, user: replication, address: "192.168.33.2/32", method: md5, comment: "Allow replication" }
+    postgresql_admin_user: "postgres"
+    postgresql_service_user: "{{ postgresql_admin_user }}"
+    postgresql_service_group: "{{ postgresql_admin_user }}"
+    postgresql_default_auth_method: "trust"
+  tasks:
+    - name: PostgreSQL | Add PostgreSQL repository apt-key
+      apt_key:
+        id: "ACCC4CF8"
+        url: "https://www.postgresql.org/media/keys/ACCC4CF8.asc"
+        state: present
+
+    - name: PostgreSQL | Add PostgreSQL repository
+      apt_repository:
+        repo: "deb http://apt.postgresql.org/pub/repos/apt/ {{ ansible_distribution_release }}-pgdg main {{ postgresql_version }}"
+        state: present
+
+    - name: PostgreSQL | Add PostgreSQL repository preferences
+      template:
+        src: etc_apt_preferences.d_apt_postgresql_org_pub_repos_apt.pref.j2
+        dest: /etc/apt/preferences.d/apt_postgresql_org_pub_repos_apt.pref
+
+    - name: PostgreSQL | Make sure the dependencies are installed
+      apt:
+        pkg: "{{item}}"
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+      with_items:
+        - python3-psycopg2
+        - locales
+
+    - name: PostgreSQL | Install PostgreSQL
+      apt:
+        name: "{{item}}"
+        state: present
+        update_cache: yes
+        default_release: "{{postgresql_default_release | default(ansible_distribution_release + '-pgdg')}}"
+        cache_valid_time: 3600
+      environment: "{{postgresql_env}}"
+      with_items:
+        - "postgresql-{{postgresql_version}}"
+        - "postgresql-client-{{postgresql_version}}"
+        - "postgresql-contrib-{{postgresql_version}}"
+
+    - name: pg_hba.conf
+      template:
+        src: pg_hba.conf.j2
+        dest: "/etc/postgresql/9.6/main/pg_hba.conf"
+        owner: "{{ postgresql_service_user }}"
+        group: "{{ postgresql_service_group }}"
+        mode: 0640
+      notify:
+        - reload postgresql
+
+    - name: postgresql.conf
+      template:
+        src: postgresql.conf.j2
+        dest: "/etc/postgresql/9.6/main/postgresql.conf"
+        owner: "{{ postgresql_service_user }}"
+        group: "{{ postgresql_service_group }}"
+        mode: 0640
+      notify:
+        - reload postgresql
+
+    - name: copy dump
+      copy:
+        src: dump.sql
+        dest: /tmp/dump.sql
+
+    - name: Createdb
+      postgresql_db:
+        name: "alfa"
+        owner: "{{ postgresql_admin_user }}"
+        state: present
+        login_user: "{{postgresql_admin_user}}"
+      become: yes
+      become_user: "{{postgresql_admin_user}}"
+
+    - name: Restore db
+      postgresql_db:
+        name: "alfa"
+        state: restore
+        target: /tmp/dump.sql
+        login_user: "{{postgresql_admin_user}}"
+      become: yes
+      become_user: "{{postgresql_admin_user}}"
+
+    - name: User for replica
+      postgresql_user:
+        name: "replication"
+        password: "replication"
+        state: present
+        login_user: "{{postgresql_admin_user}}"
+        role_attr_flags: replication
+      become: yes
+      become_user: "{{postgresql_admin_user}}"
+
+  handlers:
+    - name: reload postgresql
+      systemd:
+        service: postgresql.service
+        state: reloaded
+
