@@ -19,7 +19,7 @@
       - { type: host,  database: all, user: all, address: "127.0.0.1/32", method: "{{ postgresql_default_auth_method }}", comment: "IPv4 local connections:" }
       - { type: host,  database: all, user: all, address: "::1/128",      method: "{{ postgresql_default_auth_method }}", comment: "IPv6 local connections:" }
     postgresql_pg_hba_custom:
-      - { type: host, database: replication, user: replication, address: "192.168.33.2/32", method: md5, comment: "Allow replication" }
+      - { type: host, database: replication, user: replication, address: "192.168.33.2/32", method: trust, comment: "Allow replication" }
     postgresql_admin_user: "postgres"
     postgresql_service_user: "{{ postgresql_admin_user }}"
     postgresql_service_group: "{{ postgresql_admin_user }}"
@@ -97,6 +97,7 @@
         login_user: "{{postgresql_admin_user}}"
       become: yes
       become_user: "{{postgresql_admin_user}}"
+      when: pg_role == 'master'
 
     - name: Restore db
       postgresql_db:
@@ -106,6 +107,7 @@
         login_user: "{{postgresql_admin_user}}"
       become: yes
       become_user: "{{postgresql_admin_user}}"
+      when: pg_role == 'master'
 
     - name: User for replica
       postgresql_user:
@@ -116,6 +118,37 @@
         role_attr_flags: replication
       become: yes
       become_user: "{{postgresql_admin_user}}"
+      when: pg_role == 'master'
+      register: init_replication
+
+    - name: restart master
+      systemd:
+        service: postgresql.service
+        state: restarted
+      when: init_replication.changed and pg_role == 'master'
+
+    - name: Stop slave replica
+      systemd:
+        service: postgresql.service
+        state: stopped
+      when: pg_role == 'slave'
+
+    - name: Remove replica data
+      shell: rm -rf /var/lib/postgresql/9.6/main/*
+      become: yes
+      when: pg_role == 'slave'
+
+    - name: Synchronyze replica
+      shell: pg_basebackup -h 192.168.33.1 -D /var/lib/postgresql/9.6/main -R -P -U replication --xlog-method=stream
+      become: yes
+      become_user: "{{postgresql_admin_user}}"
+      when: pg_role == 'slave'
+
+    - name: Start slave replica
+      systemd:
+        service: postgresql.service
+        state: started
+      when: pg_role == 'slave'
 
   handlers:
     - name: reload postgresql
