@@ -3,8 +3,9 @@
   gather_facts: true
   become: true
   vars:
-    max_wal_senders: 3
-    postgresql_version: 9.6
+    max_wal_senders: 5
+    max_replication_slots: 5
+    postgresql_version: 10
     postgresql_locale_parts:
       - "en_US" # Locale
       - "UTF-8" # Encoding
@@ -20,28 +21,29 @@
       - { type: host,  database: all, user: all, address: "::1/128",      method: "{{ postgresql_default_auth_method }}", comment: "IPv6 local connections:" }
     postgresql_pg_hba_custom:
       - { type: host, database: replication, user: replication, address: "192.168.33.2/32", method: trust, comment: "Allow replication" }
+      - { type: host, database: alfa, user: postgres, address: "192.168.33.3/32", method: trust, comment: "Allow replication" }
     postgresql_admin_user: "postgres"
     postgresql_service_user: "{{ postgresql_admin_user }}"
     postgresql_service_group: "{{ postgresql_admin_user }}"
     postgresql_default_auth_method: "trust"
   tasks:
-    - name: PostgreSQL | Add PostgreSQL repository apt-key
+    - name: Add repository apt-key
       apt_key:
         id: "ACCC4CF8"
         url: "https://www.postgresql.org/media/keys/ACCC4CF8.asc"
         state: present
 
-    - name: PostgreSQL | Add PostgreSQL repository
+    - name: Add  repository
       apt_repository:
         repo: "deb http://apt.postgresql.org/pub/repos/apt/ {{ ansible_distribution_release }}-pgdg main {{ postgresql_version }}"
         state: present
 
-    - name: PostgreSQL | Add PostgreSQL repository preferences
+    - name: Add repository preferences
       template:
         src: etc_apt_preferences.d_apt_postgresql_org_pub_repos_apt.pref.j2
         dest: /etc/apt/preferences.d/apt_postgresql_org_pub_repos_apt.pref
 
-    - name: PostgreSQL | Make sure the dependencies are installed
+    - name: dependencies are installed
       apt:
         pkg: "{{item}}"
         state: present
@@ -51,7 +53,7 @@
         - python3-psycopg2
         - locales
 
-    - name: PostgreSQL | Install PostgreSQL
+    - name: Install PostgreSQL
       apt:
         name: "{{item}}"
         state: present
@@ -67,7 +69,7 @@
     - name: pg_hba.conf
       template:
         src: pg_hba.conf.j2
-        dest: "/etc/postgresql/9.6/main/pg_hba.conf"
+        dest: "/etc/postgresql/{{ postgresql_version }}/main/pg_hba.conf"
         owner: "{{ postgresql_service_user }}"
         group: "{{ postgresql_service_group }}"
         mode: 0640
@@ -77,17 +79,12 @@
     - name: postgresql.conf
       template:
         src: postgresql.conf.j2
-        dest: "/etc/postgresql/9.6/main/postgresql.conf"
+        dest: "/etc/postgresql/{{ postgresql_version }}/main/postgresql.conf"
         owner: "{{ postgresql_service_user }}"
         group: "{{ postgresql_service_group }}"
         mode: 0640
       notify:
         - reload postgresql
-
-    - name: copy dump
-      copy:
-        src: dump.sql
-        dest: /tmp/dump.sql
 
     - name: Createdb
       postgresql_db:
@@ -97,17 +94,27 @@
         login_user: "{{postgresql_admin_user}}"
       become: yes
       become_user: "{{postgresql_admin_user}}"
-      when: pg_role == 'master'
+      when: pg_role == 'master' or pg_role == 'logic'
+      register: create_alfa
 
-    - name: Restore db
-      postgresql_db:
-        name: "alfa"
-        state: restore
-        target: /tmp/dump.sql
-        login_user: "{{postgresql_admin_user}}"
+    - name: Create tables ans subscription
+      shell: >
+        psql --dbname=alfa -c "
+        CREATE TABLE table_a(id INT PRIMARY KEY, a_value TEXT);
+        CREATE TABLE table_b(id INT PRIMARY KEY, b_value TEXT);
+        CREATE TABLE table_c(id INT PRIMARY KEY, c_value TEXT);
+        CREATE PUBLICATION pub FOR TABLE table_a, table_b;"
       become: yes
       become_user: "{{postgresql_admin_user}}"
-      when: pg_role == 'master'
+      when: create_alfa.changed and pg_role == 'master'
+
+    - name: Create tables
+      shell: psql --dbname=alfa -c "
+        CREATE TABLE table_a(id INT PRIMARY KEY, a_value TEXT);
+        CREATE TABLE table_b(id INT PRIMARY KEY, b_value TEXT);"
+      become: yes
+      become_user: "{{postgresql_admin_user}}"
+      when: create_alfa.changed and pg_role == 'logic'
 
     - name: User for replica
       postgresql_user:
@@ -119,13 +126,25 @@
       become: yes
       become_user: "{{postgresql_admin_user}}"
       when: pg_role == 'master'
-      register: init_replication
 
     - name: restart master
       systemd:
         service: postgresql.service
         state: restarted
-      when: init_replication.changed and pg_role == 'master'
+      when: create_alfa.changed and pg_role == 'master'
+
+    - name: Wait master
+      wait_for:
+        timeout: 30
+        port: 5432
+        host: 192.168.33.1
+
+    - name: Create subscription
+      shell: psql --dbname=alfa -c "
+        CREATE SUBSCRIPTION sub CONNECTION 'host=192.168.33.1 user=postgres dbname=alfa' PUBLICATION pub;"
+      become: yes
+      become_user: "{{postgresql_admin_user}}"
+      when: create_alfa.changed and pg_role == 'logic'
 
     - name: Stop slave replica
       systemd:
@@ -134,12 +153,12 @@
       when: pg_role == 'slave'
 
     - name: Remove replica data
-      shell: rm -rf /var/lib/postgresql/9.6/main/*
+      shell: rm -rf /var/lib/postgresql/{{ postgresql_version }}/main/*
       become: yes
       when: pg_role == 'slave'
 
     - name: Synchronyze replica
-      shell: pg_basebackup -h 192.168.33.1 -D /var/lib/postgresql/9.6/main -R -P -U replication --xlog-method=stream
+      shell: pg_basebackup -h 192.168.33.1 -D /var/lib/postgresql/{{ postgresql_version }}/main -R -P -U replication
       become: yes
       become_user: "{{postgresql_admin_user}}"
       when: pg_role == 'slave'

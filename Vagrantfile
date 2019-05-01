@@ -9,4 +9,8 @@ Vagrant.configure("2") do |config|
       pg_slave.vm.network "private_network", ip: "192.168.33.2", virtualbox__intnet: "private1"
   end
 
+  config.vm.define "pg_logic" do |pg_logic|
+      pg_logic.vm.network "private_network", ip: "192.168.33.3", virtualbox__intnet: "private1"
+  end
+
 end
